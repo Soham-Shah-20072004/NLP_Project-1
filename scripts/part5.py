@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""
+Part 5: Improving the VSM IR System on the Cranfield dataset.
+
+Implements and evaluates four retrieval systems:
+  1. Baseline TF-IDF VSM (from informationRetrieval.py)
+  2. BM25 ranking
+  3. Latent Semantic Analysis (LSA) via truncated SVD
+  4. Query Expansion via WordNet  (from part5_ideas.tex)
+
+Run:
+    python part5.py
+"""
+
+import json
+import math
+import time
+import os
+import sys
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from collections import defaultdict, Counter
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import svds
+from scipy.stats import wilcoxon
+
+import nltk
+from nltk.corpus import wordnet
+from nltk.stem import PorterStemmer
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.informationRetrieval import InformationRetrieval
+from src.evaluation import Evaluation
+from src.sentenceSegmentation import SentenceSegmentation
+from src.tokenization import Tokenization
+from src.inflectionReduction import InflectionReduction
+from src.stopwordRemoval import StopwordRemoval
+
+DATASET   = "cranfield"
+OUT_DIR   = "results/part5"
+K_MAX     = 10
+
+BM25_K1   = 1.5
+BM25_B    = 0.75
+
+LSA_DIMS  = [50, 100, 200, 300]
+
+QE_LAMBDA = 0.5  # synonym weight discount factor
+
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(os.path.join(OUT_DIR, "figures"), exist_ok=True)
+
+
+def preprocess(texts):
+    """
+    Full preprocessing pipeline: segmentation → tokenization →
+    inflection reduction (Porter stemming) → stopword removal.
+
+    Returns
+    -------
+    processed : list[list[list[str]]]
+        Fully preprocessed texts (list of docs/queries, each is
+        a list of sentences, each sentence is a list of tokens).
+    raw_tokens : list[list[list[str]]]
+        Tokenised but NOT stemmed (used for WordNet expansion).
+    """
+    segmenter = SentenceSegmentation()
+    tokenizer = Tokenization()
+    reducer   = InflectionReduction()
+    remover   = StopwordRemoval()
+
+    segs    = [segmenter.punkt(t) for t in texts]
+    toks    = [tokenizer.pennTreeBank(s) for s in segs]
+    reduced = [reducer.reduce(t) for t in toks]
+    clean   = [remover.fromList(r) for r in reduced]
+    return clean, toks
+
+
+def load_cranfield():
+    with open(os.path.join(DATASET, "cran_docs.json")) as f:
+        docs_json = json.load(f)
+    with open(os.path.join(DATASET, "cran_queries.json")) as f:
+        queries_json = json.load(f)
+    with open(os.path.join(DATASET, "cran_qrels.json")) as f:
+        qrels = json.load(f)
+
+    doc_ids     = [item["id"]           for item in docs_json]
+    doc_texts   = [item["body"]         for item in docs_json]
+    query_ids   = [item["query number"] for item in queries_json]
+    query_texts = [item["query"]        for item in queries_json]
+
+    return doc_ids, doc_texts, query_ids, query_texts, qrels
+
+
+# ---------------------------------------------------------------------------
+# BM25
+# ---------------------------------------------------------------------------
+class BM25Retrieval:
+    """BM25 ranking with Okapi BM25 score (Robertson et al.)."""
+
+    def __init__(self, k1=BM25_K1, b=BM25_B):
+        self.k1 = k1
+        self.b  = b
+
+    def buildIndex(self, docs, doc_ids):
+        self.doc_ids = doc_ids
+        N  = len(docs)
+        df = defaultdict(int)
+        self.doc_tf  = []
+        self.doc_len = []
+
+        for doc in docs:
+            terms = [t for sent in doc for t in sent]
+            tf    = Counter(terms)
+            self.doc_tf.append(tf)
+            self.doc_len.append(sum(tf.values()))
+            for term in tf:
+                df[term] += 1
+
+        self.avgdl = sum(self.doc_len) / N if N > 0 else 1.0
+        # BM25 IDF (Robertson-Sparck Jones variant, always positive)
+        self.idf = {
+            term: math.log((N - cnt + 0.5) / (cnt + 0.5) + 1.0)
+            for term, cnt in df.items()
+        }
+
+    def rank(self, queries):
+        results = []
+        for query in queries:
+            terms  = [t for sent in query for t in sent]
+            scores = []
+            for idx, tf in enumerate(self.doc_tf):
+                dl    = self.doc_len[idx]
+                score = 0.0
+                for term in terms:
+                    if term not in self.idf:
+                        continue
+                    f = tf.get(term, 0)
+                    score += self.idf[term] * (
+                        f * (self.k1 + 1)
+                    ) / (
+                        f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                    )
+                scores.append((score, self.doc_ids[idx]))
+            scores.sort(key=lambda x: x[0], reverse=True)
+            results.append([d for _, d in scores])
+        return results
+
+
+# ---------------------------------------------------------------------------
+# LSA
+# ---------------------------------------------------------------------------
+class LSARetrieval:
+    """
+    Latent Semantic Analysis via truncated SVD.
+    Documents and queries are projected into a k-dimensional
+    latent space; retrieval uses cosine similarity there.
+    """
+
+    def __init__(self, n_components=100):
+        self.k = n_components
+
+    def buildIndex(self, docs, doc_ids):
+        self.doc_ids = doc_ids
+
+        # Build vocabulary from all preprocessed docs
+        vocab = sorted({t for doc in docs for sent in doc for t in sent})
+        self.vocab    = vocab
+        self.term2idx = {t: i for i, t in enumerate(vocab)}
+        m, n = len(vocab), len(docs)
+
+        # TF-IDF term×doc matrix
+        df      = defaultdict(int)
+        doc_tfs = []
+        for doc in docs:
+            terms = [t for sent in doc for t in sent]
+            tf    = Counter(terms)
+            doc_tfs.append(tf)
+            for term in tf:
+                df[term] += 1
+
+        idf = {t: math.log10(n / df[t]) for t in df}
+
+        A = lil_matrix((m, n), dtype=np.float32)
+        for j, tf in enumerate(doc_tfs):
+            for term, cnt in tf.items():
+                i       = self.term2idx[term]
+                A[i, j] = cnt * idf[term]
+        A = A.tocsr()
+
+        k_actual  = min(self.k, m - 1, n - 1)
+        U, S, Vt  = svds(A, k=k_actual)          # U:(m,k) S:(k,) Vt:(k,n)
+
+        # Sort singular values descending
+        order  = np.argsort(S)[::-1]
+        self.U = U[:, order]                      # (m, k)
+        self.S = S[order]                         # (k,)
+        self.Vt = Vt[order, :]                    # (k, n)
+
+        # Document vectors in latent space: rows of V * Sigma → (n, k)
+        self.doc_vecs  = (np.diag(self.S) @ self.Vt).T
+        self.doc_norms = np.linalg.norm(self.doc_vecs, axis=1) + 1e-10
+
+    def rank(self, queries):
+        results = []
+        m = len(self.vocab)
+        for query in queries:
+            terms = [t for sent in query for t in sent]
+            q_vec = np.zeros(m, dtype=np.float32)
+            for t in terms:
+                if t in self.term2idx:
+                    q_vec[self.term2idx[t]] += 1.0
+
+            # Fold into latent space: q_lat = q^T U Sigma^{-1}
+            q_lat  = (q_vec @ self.U) / (self.S + 1e-10)   # (k,)
+            q_norm = np.linalg.norm(q_lat) + 1e-10
+
+            cosines = (self.doc_vecs @ q_lat) / (self.doc_norms * q_norm)
+            order   = np.argsort(cosines)[::-1]
+            results.append([self.doc_ids[i] for i in order])
+        return results
+
+
+# ---------------------------------------------------------------------------
+# WordNet Query Expansion
+# ---------------------------------------------------------------------------
+class QueryExpansionRetrieval:
+    """
+    TF-IDF VSM with WordNet-based query expansion.
+    For each raw query token, synonyms from WordNet are added
+    with a discounted weight λ < 1.
+    """
+
+    def __init__(self, lam=QE_LAMBDA):
+        self.lam     = lam
+        self.stemmer = PorterStemmer()
+        self.ir      = InformationRetrieval()
+
+    def buildIndex(self, docs, doc_ids):
+        self.ir.buildIndex(docs, doc_ids)
+
+    def _expand_weights(self, raw_token_sents):
+        """
+        Build a term→weight dict for one query using WordNet synonyms.
+        raw_token_sents: list of lists of tokens (tokenised, not stemmed).
+        """
+        weights = defaultdict(float)
+        for sent in raw_token_sents:
+            for token in sent:
+                stemmed         = self.stemmer.stem(token.lower())
+                weights[stemmed] = max(weights[stemmed], 1.0)
+                # Add synonyms from all WordNet synsets
+                for syn in wordnet.synsets(token.lower()):
+                    for lemma in syn.lemmas():
+                        syn_stem          = self.stemmer.stem(
+                            lemma.name().replace("_", " ").lower()
+                        )
+                        weights[syn_stem] = max(weights[syn_stem], self.lam)
+        return weights
+
+    def rank(self, queries_processed, queries_raw_tokens):
+        """
+        Parameters
+        ----------
+        queries_processed   : preprocessed (stemmed+filtered) queries
+        queries_raw_tokens  : tokenised-only queries (for WordNet lookup)
+        """
+        idf         = self.ir.idf
+        doc_vectors = self.ir.doc_vectors
+        doc_norms   = self.ir.doc_norms
+        doc_ids     = self.ir.doc_ids
+        results     = []
+
+        for q_raw in queries_raw_tokens:
+            expanded = self._expand_weights(q_raw)
+
+            # Build TF-IDF query vector over expanded terms
+            q_vec     = {}
+            q_norm_sq = 0.0
+            for term, w in expanded.items():
+                if term in idf:
+                    val           = w * idf[term]
+                    q_vec[term]   = val
+                    q_norm_sq    += val * val
+            q_norm = math.sqrt(q_norm_sq) if q_norm_sq > 0 else 0.0
+
+            scores = []
+            for idx, dv in enumerate(doc_vectors):
+                dn = doc_norms[idx]
+                if q_norm == 0 or dn == 0:
+                    score = 0.0
+                else:
+                    dot   = sum(q_vec.get(t, 0) * dv.get(t, 0) for t in q_vec)
+                    score = dot / (q_norm * dn)
+                scores.append((score, doc_ids[idx]))
+
+            scores.sort(key=lambda x: x[0], reverse=True)
+            results.append([d for _, d in scores])
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+def per_query_ap(ranked_results, query_ids, qrels, ev):
+    """
+    Returns list of per-query AP values (standard MAP, no k cut-off).
+    """
+    aps = []
+    for i, qid in enumerate(query_ids):
+        true_ids = ev._get_true_doc_IDs(qid, qrels)
+        if not true_ids:
+            continue
+        aps.append(ev.queryAveragePrecision(ranked_results[i], true_ids))
+    return aps
+
+
+def evaluate_at_all_k(ranked_results, query_ids, qrels, ev, k_max=K_MAX):
+    """
+    Returns dict of metrics.
+
+    List metrics (one value per k in 1..k_max):
+        precision, recall, fscore, ndcg
+
+    Scalar metrics (standard, no k cut-off):
+        map, mrr
+    """
+    metrics = {
+        "precision": [],
+        "recall":    [],
+        "fscore":    [],
+        "ndcg":      [],
+    }
+
+    for k in range(1, k_max + 1):
+        metrics["precision"].append(
+            ev.meanPrecision(ranked_results, query_ids, qrels, k)
+        )
+        metrics["recall"].append(
+            ev.meanRecall(ranked_results, query_ids, qrels, k)
+        )
+        metrics["fscore"].append(
+            ev.meanFscore(ranked_results, query_ids, qrels, k)
+        )
+        metrics["ndcg"].append(
+            ev.meanNDCG(ranked_results, query_ids, qrels, k)
+        )
+
+    # Standard MAP and MRR — no k parameter
+    metrics["map"] = ev.meanAveragePrecision(ranked_results, query_ids, qrels)
+    metrics["mrr"] = ev.meanReciprocalRank(ranked_results, query_ids, qrels)
+
+    return metrics
+
+
+def count_zero_result(ranked_results, query_ids, qrels, ev):
+    """Queries for which no relevant doc appears in any retrieved position."""
+    zero = 0
+    for i, qid in enumerate(query_ids):
+        true_ids = ev._get_true_doc_IDs(qid, qrels)
+        if not true_ids:
+            continue
+        rr = ev.queryReciprocalRank(ranked_results[i], true_ids)
+        if rr == 0.0:
+            zero += 1
+    return zero
+
+
+def wilcoxon_pvalue(ap_a, ap_b):
+    """Two-sided Wilcoxon signed-rank test on paired AP vectors."""
+    diffs = [a - b for a, b in zip(ap_a, ap_b)]
+    if all(d == 0 for d in diffs):
+        return 1.0
+    _, p = wilcoxon(ap_a, ap_b)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_system_metrics(metrics_dict, title, fname):
+    """
+    For a single system, plot all six metrics.
+    List metrics (precision, recall, fscore, ndcg) are plotted as curves
+    over k.  Scalar metrics (map, mrr) are drawn as horizontal dashed lines.
+    """
+    ks   = list(range(1, K_MAX + 1))
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    axes = axes.flatten()
+
+    panel_keys = [
+        ("precision", "Precision@k"),
+        ("recall",    "Recall@k"),
+        ("fscore",    "F0.5@k"),
+        ("ndcg",      "nDCG@k"),
+        ("map",       "MAP (standard)"),
+        ("mrr",       "MRR (standard)"),
+    ]
+
+    def _zoom_ylim(values):
+        vmin = min(values)
+        vmax = max(values)
+        span = vmax - vmin
+        pad = 0.05 * span if span > 0 else 0.02
+        lo = max(0.0, vmin - pad)
+        hi = min(1.0, vmax + pad)
+        if lo == hi:
+            lo = max(0.0, lo - 0.02)
+            hi = min(1.0, hi + 0.02)
+        return lo, hi
+
+    for ax, (key, label) in zip(axes, panel_keys):
+        val = metrics_dict[key]
+        if isinstance(val, list):
+            ax.plot(ks, val, marker="o", linewidth=1.5)
+            ax.set_xlabel("k")
+            ax.set_xticks(ks)
+            ax.set_ylim(*_zoom_ylim(val))
+        else:
+            # scalar — draw a horizontal reference line
+            ax.axhline(val, color="tomato", linewidth=2, linestyle="--")
+            ax.text(
+                ks[-1], val, f"  {val:.4f}",
+                va="bottom", ha="right", fontsize=10, color="tomato"
+            )
+            ax.set_xlim(ks[0], ks[-1])
+            ax.set_xlabel("")
+            ax.set_xticks([])
+            ax.set_ylim(*_zoom_ylim([val]))
+        ax.set_title(label)
+        ax.grid(True, alpha=0.4)
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(OUT_DIR, "figures", fname)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_metric_comparison(all_metrics, metric, ylabel, title, fname):
+    """
+    Compare a single list-metric across multiple systems (curves over k).
+    Only call this with list metrics: precision, recall, fscore, ndcg.
+    """
+    ks = list(range(1, K_MAX + 1))
+    plt.figure(figsize=(8, 5))
+    all_vals = []
+    for name, m in all_metrics.items():
+        val = m[metric]
+        if isinstance(val, list):
+            plt.plot(ks, val, marker="o", label=name, linewidth=1.5)
+            all_vals.extend(val)
+        else:
+            # scalar — horizontal line for consistency if accidentally called
+            plt.axhline(val, linestyle="--", label=name, linewidth=1.5)
+            all_vals.append(val)
+    plt.xlabel("k")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.xticks(ks)
+    if all_vals:
+        vmin = min(all_vals)
+        vmax = max(all_vals)
+        span = vmax - vmin
+        pad = 0.05 * span if span > 0 else 0.02
+        plt.ylim(max(0.0, vmin - pad), min(1.0, vmax + pad))
+    plt.legend()
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    path = os.path.join(OUT_DIR, "figures", fname)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_lsa_sweep(lsa_maps, chosen_k):
+    """Bar chart of MAP vs LSA dimension k."""
+    ks   = list(lsa_maps.keys())
+    maps = list(lsa_maps.values())
+    plt.figure(figsize=(6, 4))
+    bars = plt.bar([str(k) for k in ks], maps, color="steelblue")
+    idx  = ks.index(chosen_k)
+    bars[idx].set_color("tomato")
+    plt.xlabel("Number of LSA dimensions")
+    plt.ylabel("MAP")
+    plt.title("LSA: MAP vs number of latent dimensions")
+    if maps:
+        vmin = min(maps)
+        vmax = max(maps)
+        span = vmax - vmin
+        pad = 0.05 * span if span > 0 else 0.02
+        plt.ylim(max(0.0, vmin - pad), min(1.0, vmax + pad))
+    plt.tight_layout()
+    path = os.path.join(OUT_DIR, "figures", "lsa_k_sweep.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def print_table(rows, headers, title=""):
+    col_widths = [
+        max(len(h), max(len(str(r[i])) for r in rows))
+        for i, h in enumerate(headers)
+    ]
+    sep = "+-" + "-+-".join("-" * w for w in col_widths) + "-+"
+    fmt = "| " + " | ".join(f"{{:<{w}}}" for w in col_widths) + " |"
+    if title:
+        print(f"\n{'─' * len(sep)}")
+        print(f"  {title}")
+    print(sep)
+    print(fmt.format(*headers))
+    print(sep)
+    for row in rows:
+        print(fmt.format(*[str(v) for v in row]))
+    print(sep)
+
+
+def fmt(x, decimals=4):
+    return f"{x:.{decimals}f}"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    # ── Load data ──────────────────────────────────────────────────────────
+    print("\nLoading and preprocessing Cranfield dataset …")
+    doc_ids, doc_texts, query_ids, query_texts, qrels = load_cranfield()
+    print(f"  Documents : {len(doc_ids)}")
+    print(f"  Queries   : {len(query_ids)}")
+    print(f"  Qrels     : {len(qrels)}")
+
+    # ── Preprocessing ──────────────────────────────────────────────────────
+    t0 = time.time()
+    docs_processed, _            = preprocess(doc_texts)
+    queries_processed, queries_raw = preprocess(query_texts)
+    preprocess_time = time.time() - t0
+    print(f"  Preprocessing done in {preprocess_time:.1f}s")
+
+    ev = Evaluation()
+
+    # ── Baseline TF-IDF VSM ────────────────────────────────────────────────
+    print("\nBaseline TF-IDF VSM …")
+    vsm = InformationRetrieval()
+    t0  = time.time()
+    vsm.buildIndex(docs_processed, doc_ids)
+    vsm_ranked  = vsm.rank(queries_processed)
+    vsm_time    = time.time() - t0
+    vsm_metrics = evaluate_at_all_k(vsm_ranked, query_ids, qrels, ev)
+    vsm_ap      = per_query_ap(vsm_ranked, query_ids, qrels, ev)
+    vsm_zero    = count_zero_result(vsm_ranked, query_ids, qrels, ev)
+    print(f"  MAP={fmt(vsm_metrics['map'])}  MRR={fmt(vsm_metrics['mrr'])}"
+          f"  nDCG@{K_MAX}={fmt(vsm_metrics['ndcg'][-1])}  time={vsm_time:.2f}s")
+    plot_system_metrics(vsm_metrics, "Baseline TF-IDF VSM", "vsm_metrics.png")
+
+    # ── BM25 ───────────────────────────────────────────────────────────────
+    print(f"\nBM25 (k1={BM25_K1}, b={BM25_B}) …")
+    bm25 = BM25Retrieval()
+    t0   = time.time()
+    bm25.buildIndex(docs_processed, doc_ids)
+    bm25_ranked  = bm25.rank(queries_processed)
+    bm25_time    = time.time() - t0
+    bm25_metrics = evaluate_at_all_k(bm25_ranked, query_ids, qrels, ev)
+    bm25_ap      = per_query_ap(bm25_ranked, query_ids, qrels, ev)
+    bm25_zero    = count_zero_result(bm25_ranked, query_ids, qrels, ev)
+    bm25_p       = wilcoxon_pvalue(bm25_ap, vsm_ap)
+    print(f"  MAP={fmt(bm25_metrics['map'])}  MRR={fmt(bm25_metrics['mrr'])}"
+          f"  nDCG@{K_MAX}={fmt(bm25_metrics['ndcg'][-1])}  time={bm25_time:.2f}s")
+    print(f"  Wilcoxon vs VSM  p={bm25_p:.4f}  "
+          f"{'SIGNIFICANT' if bm25_p < 0.05 else 'not significant'} at α=0.05")
+    plot_system_metrics(bm25_metrics, "BM25", "bm25_metrics.png")
+
+    # ── LSA – sweep over k ─────────────────────────────────────────────────
+    print(f"\nLSA – sweeping k ∈ {LSA_DIMS} …")
+    lsa_map_sweep    = {}
+    lsa_results_all  = {}
+    for k_dim in LSA_DIMS:
+        lsa     = LSARetrieval(n_components=k_dim)
+        t0      = time.time()
+        lsa.buildIndex(docs_processed, doc_ids)
+        ranked  = lsa.rank(queries_processed)
+        elapsed = time.time() - t0
+        # Use standard MAP (no k) for model selection
+        map_val = ev.meanAveragePrecision(ranked, query_ids, qrels)
+        lsa_map_sweep[k_dim]    = map_val
+        lsa_results_all[k_dim]  = (lsa, ranked, elapsed)
+        print(f"  k={k_dim:>3d}  MAP={fmt(map_val)}  time={elapsed:.1f}s")
+
+    best_k = max(lsa_map_sweep, key=lsa_map_sweep.get)
+    print(f"  → Best k = {best_k}  (MAP = {fmt(lsa_map_sweep[best_k])})")
+    plot_lsa_sweep(lsa_map_sweep, best_k)
+
+    lsa_best, lsa_ranked, lsa_time = lsa_results_all[best_k]
+    lsa_metrics = evaluate_at_all_k(lsa_ranked, query_ids, qrels, ev)
+    lsa_ap      = per_query_ap(lsa_ranked, query_ids, qrels, ev)
+    lsa_zero    = count_zero_result(lsa_ranked, query_ids, qrels, ev)
+    lsa_p       = wilcoxon_pvalue(lsa_ap, vsm_ap)
+    print(f"  MAP={fmt(lsa_metrics['map'])}  MRR={fmt(lsa_metrics['mrr'])}"
+          f"  nDCG@{K_MAX}={fmt(lsa_metrics['ndcg'][-1])}")
+    print(f"  Wilcoxon vs VSM  p={lsa_p:.4f}  "
+          f"{'SIGNIFICANT' if lsa_p < 0.05 else 'not significant'} at α=0.05")
+    plot_system_metrics(lsa_metrics, f"LSA (k={best_k})", "lsa_metrics.png")
+
+    # ── WordNet Query Expansion ────────────────────────────────────────────
+    print(f"\nWordNet Query Expansion (λ={QE_LAMBDA}) …")
+    qe = QueryExpansionRetrieval()
+    t0 = time.time()
+    qe.buildIndex(docs_processed, doc_ids)
+    qe_ranked  = qe.rank(queries_processed, queries_raw)
+    qe_time    = time.time() - t0
+    qe_metrics = evaluate_at_all_k(qe_ranked, query_ids, qrels, ev)
+    qe_ap      = per_query_ap(qe_ranked, query_ids, qrels, ev)
+    qe_zero    = count_zero_result(qe_ranked, query_ids, qrels, ev)
+    qe_p       = wilcoxon_pvalue(qe_ap, vsm_ap)
+    print(f"  MAP={fmt(qe_metrics['map'])}  MRR={fmt(qe_metrics['mrr'])}"
+          f"  nDCG@{K_MAX}={fmt(qe_metrics['ndcg'][-1])}  time={qe_time:.2f}s")
+    print(f"  Zero-result queries: VSM={vsm_zero}  QE={qe_zero}")
+    print(f"  Wilcoxon vs VSM  p={qe_p:.4f}  "
+          f"{'SIGNIFICANT' if qe_p < 0.05 else 'not significant'} at α=0.05")
+    plot_system_metrics(qe_metrics, "WordNet Query Expansion", "qe_metrics.png")
+
+    # ── Comparison plots (list metrics only) ──────────────────────────────
+    all_metrics = {
+        "VSM (baseline)":    vsm_metrics,
+        "BM25":              bm25_metrics,
+        f"LSA (k={best_k})": lsa_metrics,
+        "Query Expansion":   qe_metrics,
+    }
+    plot_metric_comparison(all_metrics, "ndcg",      "nDCG@k",  "All systems: nDCG@k",  "all_ndcg.png")
+    plot_metric_comparison(all_metrics, "precision", "P@k",     "All systems: P@k",      "all_precision.png")
+    plot_metric_comparison(all_metrics, "recall",    "R@k",     "All systems: R@k",      "all_recall.png")
+    plot_metric_comparison(all_metrics, "fscore",    "F0.5@k",  "All systems: F0.5@k",   "all_fscore.png")
+
+    # Scalar MAP/MRR bar chart across systems
+    sys_names = list(all_metrics.keys())
+    map_vals  = [all_metrics[s]["map"] for s in sys_names]
+    mrr_vals  = [all_metrics[s]["mrr"] for s in sys_names]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    ax1.bar(sys_names, map_vals, color="steelblue")
+    ax1.set_title("MAP (standard)")
+    ax1.set_ylabel("MAP")
+    if map_vals:
+        vmin = min(map_vals)
+        vmax = max(map_vals)
+        span = vmax - vmin
+        pad = 0.05 * span if span > 0 else 0.02
+        ax1.set_ylim(max(0.0, vmin - pad), min(1.0, vmax + pad))
+    for i, v in enumerate(map_vals):
+        ax1.text(i, v + 0.002, f"{v:.4f}", ha="center", fontsize=8)
+    ax2.bar(sys_names, mrr_vals, color="darkorange")
+    ax2.set_title("MRR (standard)")
+    ax2.set_ylabel("MRR")
+    if mrr_vals:
+        vmin = min(mrr_vals)
+        vmax = max(mrr_vals)
+        span = vmax - vmin
+        pad = 0.05 * span if span > 0 else 0.02
+        ax2.set_ylim(max(0.0, vmin - pad), min(1.0, vmax + pad))
+    for i, v in enumerate(mrr_vals):
+        ax2.text(i, v + 0.002, f"{v:.4f}", ha="center", fontsize=8)
+    plt.suptitle("All systems: scalar metrics", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    bar_path = os.path.join(OUT_DIR, "figures", "all_map_mrr_bar.png")
+    plt.savefig(bar_path, dpi=150)
+    plt.close()
+    print(f"  Saved: {bar_path}")
+
+    # ── Summary table ─────────────────────────────────────────────────────
+    print()
+    rows = [
+        ["VSM (baseline)",
+         fmt(vsm_metrics["map"]),   fmt(vsm_metrics["mrr"]),
+         fmt(vsm_metrics["precision"][-1]), fmt(vsm_metrics["recall"][-1]),
+         fmt(vsm_metrics["ndcg"][-1]),
+         str(vsm_zero),  f"{vsm_time:.2f}"],
+        ["BM25",
+         fmt(bm25_metrics["map"]),  fmt(bm25_metrics["mrr"]),
+         fmt(bm25_metrics["precision"][-1]), fmt(bm25_metrics["recall"][-1]),
+         fmt(bm25_metrics["ndcg"][-1]),
+         str(bm25_zero), f"{bm25_time:.2f}"],
+        [f"LSA k={best_k}",
+         fmt(lsa_metrics["map"]),   fmt(lsa_metrics["mrr"]),
+         fmt(lsa_metrics["precision"][-1]), fmt(lsa_metrics["recall"][-1]),
+         fmt(lsa_metrics["ndcg"][-1]),
+         str(lsa_zero),  f"{lsa_time:.2f}"],
+        ["Query Expansion",
+         fmt(qe_metrics["map"]),    fmt(qe_metrics["mrr"]),
+         fmt(qe_metrics["precision"][-1]), fmt(qe_metrics["recall"][-1]),
+         fmt(qe_metrics["ndcg"][-1]),
+         str(qe_zero),   f"{qe_time:.2f}"],
+    ]
+    headers = ["System", "MAP", "MRR", f"P@{K_MAX}", f"R@{K_MAX}",
+               f"nDCG@{K_MAX}", "Zero", "Time(s)"]
+    print_table(rows, headers, title="Summary: All Systems on Cranfield")
+
+    # ── Wilcoxon table ─────────────────────────────────────────────────────
+    pval_rows = [
+        ["BM25 vs VSM",          f"{bm25_p:.4f}", "YES" if bm25_p < 0.05 else "no"],
+        [f"LSA k={best_k} vs VSM", f"{lsa_p:.4f}", "YES" if lsa_p < 0.05 else "no"],
+        ["QE vs VSM",            f"{qe_p:.4f}",   "YES" if qe_p  < 0.05 else "no"],
+    ]
+    print_table(pval_rows, ["Comparison", "p-value", "Sig. (α=0.05)"],
+                title="Wilcoxon Signed-Rank Tests (per-query AP)")
+
+    # ── Save full results as JSON ──────────────────────────────────────────
+    results_json = {
+        "vsm":  {**{m: vsm_metrics[m]  for m in vsm_metrics},
+                 "zero_results": vsm_zero,  "time": vsm_time},
+        "bm25": {**{m: bm25_metrics[m] for m in bm25_metrics},
+                 "zero_results": bm25_zero, "time": bm25_time, "p_vs_vsm": bm25_p},
+        "lsa":  {**{m: lsa_metrics[m]  for m in lsa_metrics},
+                 "zero_results": lsa_zero,  "time": lsa_time,
+                 "best_k": best_k, "p_vs_vsm": lsa_p,
+                 "k_sweep": {str(k): v for k, v in lsa_map_sweep.items()}},
+        "qe":   {**{m: qe_metrics[m]   for m in qe_metrics},
+                 "zero_results": qe_zero,   "time": qe_time,  "p_vs_vsm": qe_p},
+    }
+    out_path = os.path.join(OUT_DIR, "results.json")
+    with open(out_path, "w") as f:
+        json.dump(results_json, f, indent=2)
+    print(f"\nFull results saved to {out_path}")
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
